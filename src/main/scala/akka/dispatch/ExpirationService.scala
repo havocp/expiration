@@ -1,4 +1,3 @@
-
 /**
  *  Copyright (C) 2009-2011 Typesafe Inc. <http://www.typesafe.com>
  */
@@ -70,6 +69,9 @@ private[akka] trait ExpirationService {
   def addMany(expirables: Seq[Expirable]) {
     for (e <- expirables)
       add(e)
+  }
+
+  def shutdown() {
   }
 }
 
@@ -245,7 +247,7 @@ private[akka] class BatchDrainedExpirationService(maxBatch: Int, resolutionInNan
     }
   }
 
-  private val drain = new BatchDrainedQueue[Expirable](maxBatch, drainer)
+  private val drain = new BatchDrain[Expirable](maxBatch, drainer)
 
   override def queue(expirable: Expirable) {
     drain.add(expirable)
@@ -261,94 +263,213 @@ private[akka] class BatchDrainedExpirationService(maxBatch: Int, resolutionInNan
   }
 }
 
-private[akka] trait BatchDrainer[T] {
+private[akka] trait BatchDrainer[T <: AnyRef] {
+  // "drain" MUST only touch the array while it's on the stack;
+  // if it wants to defer handling, it has to copy the array.
+  // i.e. the drain must be synchronous.
   def drain(batch: Array[T], count: Int): Unit
 }
 
-private[akka] class BatchDrainedQueue[T: Manifest](maxBatch: Int,
-                                                   synchronousDrainer: BatchDrainer[T]) {
+/* This does NOT guarantee FIFO, i.e. it's not a queue */
+private[akka] class BatchDrain[T <: AnyRef : Manifest](maxBatch: Int,
+                                                       synchronousDrainer: BatchDrainer[T]) {
 
-  private class Batch[T: Manifest](val maxSize: Int, val generation: Int, val slots: Array[T]) {
+  // drainCount ends up meaning the number of threads that can run synchronousDrainer at once,
+  // since each UnreliableBatchDrain runs the drainer in the calling thread.
+  val drainCount = Runtime.getRuntime().availableProcessors()
+  val drains = new Array[UnreliableBatchDrain[T]](drainCount)
+
+  for (i <- 0 until drainCount) {
+    drains(i) = new UnreliableBatchDrain[T](maxBatch, synchronousDrainer)
+  }
+
+  // the general idea is to stay with the same drain until
+  // it won't take our items, and then switch to another one
+  // and stick to that one.
+  val current = new AtomicInteger(0)
+
+  @tailrec
+  final def add(t: T) {
+    val c = current.get
+    if (drains(c).offer(t)) {
+      // ok! best case scenario.
+    } else {
+      if (c == (drainCount - 1)) {
+        current.compareAndSet(c, 0)
+      } else {
+        current.compareAndSet(c, c + 1)
+      }
+      // now start over.
+      add(t)
+    }
+  }
+
+  def flush() {
+    drains.foreach(_.flush())
+  }
+}
+
+/* This does NOT guarantee FIFO, i.e. it's not a queue;
+ * it's also allowed to fail to queue stuff (returning false from offer())
+ */
+private[akka] class UnreliableBatchDrain[T <: AnyRef : Manifest](maxBatch: Int,
+                                                                 synchronousDrainer: BatchDrainer[T]) {
+
+  final def repeatIfInterrupted[T](body: => T): T = {
+    try {
+      body
+    } catch {
+      case e: InterruptedException =>
+        // this is unfortunately not a tail call, not sure I understand why
+        repeatIfInterrupted(body)
+    }
+  }
+
+  private class Batch[T <: AnyRef : Manifest](val maxSize: Int, val slots: Array[T], val recycleTo: BlockingQueue[Batch[T]]) {
     require(slots.size == maxSize)
-    val reserved = new AtomicInteger(0)
-    val filled = new AtomicInteger(0)
+    val reserved = new AtomicInteger(maxSize)
+    val filled = new AtomicInteger(maxSize)
     // padding = number of slots that don't have real data.
     // "padding" can only change once (set by the one thread that does a flush() on the batch)
     // and "padding" is only read while completing the batch, which is done by one thread
     // and done sequentially after the flush() writes to it.
     @volatile
     var padding = 0
+
+    // DEBUG HACK ONLY
+    @volatile
+    var maybeRecycled = true
+
+    @volatile
+    var whyRecycled: String = "initial construct"
+
+    def recycle() {
+      // these have to continue to prevent any thread that
+      // tests them while we're dead from trying to use the
+      // recycled batch.
+      assert(reserved.get >= maxSize)
+      assert(filled.get == maxSize)
+      padding = 0
+      whyRecycled = "in the dead pool, was: " + whyRecycled
+      recycleTo.add(this)
+    }
+
+    def unrecycle() {
+      try {
+        assert(maybeRecycled)
+        assert(filled.get == maxSize)
+        assert(reserved.get >= maxSize)
+        assert(padding == 0)
+      } catch {
+        case e => {
+          println("unrecycle broken: " + this)
+          throw e
+        }
+      }
+
+      // it's possible a thread still has hold of the batch
+      // from when it was previously current. having reserved
+      // >= maxSize was keeping that thread from doing anything
+      // with it; so right here, we enable that thread to again
+      // touch the object. we set other stuff first, then reserved,
+      // because reserved < maxSize is the thing that lets a thread
+      // get a reservation and thus start using the batch.
+      whyRecycled = "not recycled, alive again"
+      maybeRecycled = false
+      filled.set(0)
+      reserved.set(0) // do this LAST to "unlock"
+    }
+
+    override def toString = {
+      "Batch(reserved=%d,filled=%d,padding=%d)".format(reserved.get, filled.get, padding) + " whyRecycled=" + whyRecycled
+    }
   }
 
-  private val completeBatchLock = new ReentrantLock
-  private val newBatchCondition = completeBatchLock.newCondition
-  // protected by completeBatchLock
-  private var unusedArrays = Queue(new Array[T](maxBatch))
-  // can only be written with completeBatchLock
-  @volatile
-  private var currentBatch = new Batch[T](maxBatch, generation = 0, slots = new Array[T](maxBatch))
-  // can only be touched with completeBatchLock
-  private var nextGeneration = 1
+  private val batchPoolSize = 2 // just two batches that swap
+  private val mainPool = new ArrayBlockingQueue[Batch[T]](batchPoolSize)
 
-  // the general goal is to make an add() just an array assignment
+  private final def createBatch() = {
+    new Batch[T](maxBatch, slots = new Array[T](maxBatch), recycleTo=mainPool)
+  }
+
+  @volatile
+  private var currentBatch = createBatch()
+  currentBatch.filled.set(0)
+  currentBatch.reserved.set(0)
+  currentBatch.maybeRecycled = false
+  currentBatch.whyRecycled = "initial current batch"
+
+  // one of the batches is in currentBatch, so we put
+  // batchPoolSize - 1 in the queue.
+  for (i <- 1 to (batchPoolSize - 1)) {
+    val b = createBatch()
+    b.maybeRecycled = true
+    b.whyRecycled = "initial creation"
+    mainPool.put(b)
+  }
+
+  // the general goal is to make an this just an array assignment
   // and a couple of integer increments.
-  @tailrec
-  final def add(t: T) {
+  final def offer(t: T): Boolean = {
     val current = currentBatch
 
-    // current.reserved is allowed to go over maxSize,
-    // but we don't ever write to a slot past the end.
-    // if we get reserved < current.maxSize, then
-    // we know current.slots cannot be recycled until
-    // we increment current.filled to match the reservation.
+    // the "lock" on a Batch is owning a reserved slot
+    // less than maxSize, without having incremented
+    // "filled". i.e. if you increment reserved,
+    // get a valid array index, then the Batch is
+    // "locked" by you until you increment "filled"
+    // Also, whichever thread gets the final slot
+    // index has the lock/responsibility to complete
+    // the batch (complete = drain and recycle)
 
     val reserved = current.reserved.getAndIncrement
     if (reserved >= current.maxSize) {
-      // "current.slots" can now be recycled! because
-      // we have no reservation blocking it.
-
-      // try again with a new current batch.
+      // "current" can now be recycled! because
+      // we have no valid reservation blocking it.
       // maxSize is ideally large enough that
-      // this basically never happens.
-      try {
-        completeBatchLock.lock
-        while (current.generation == currentBatch.generation)
-          newBatchCondition.await
-      } finally {
-        completeBatchLock.unlock
-      }
-
-      add(t)
+      // this rarely happens.
+      // But we have to bail out here.
+      false
     } else {
+      try {
+        assert(current.filled.get < current.maxSize)
+        assert(!current.maybeRecycled)
+      } catch {
+        case e => {
+          println("slots=" + current.slots.toSeq)
+          println("reserved=" + reserved)
+          println("filled=" + current.filled.get)
+          println("maxSize=" + current.maxSize)
+          println("whyRecycled=" + current.whyRecycled)
+          System.out.flush()
+          throw e
+        }
+      }
       current.slots(reserved) = t
-      // once we increment "filled" the batch's slots can be recycled,
-      // so don't touch them anymore.
+      // once we increment "filled" the batch can be recycled,
+      // so don't touch the mutable parts anymore.
       val filled = current.filled.incrementAndGet
+      assert(filled <= current.maxSize)
       if (filled == current.maxSize) {
+        assert(!current.maybeRecycled)
         // we are the last add() so swap out the current batch and drain it
+        current.whyRecycled = "final slot filled with an item"
         completeBatch(current)
       }
+      true
     }
   }
 
-  private def completeBatch(completed: Batch[T]) {
-    try {
-      completeBatchLock.lock
-      val newSlots: Array[T] = if (unusedArrays.isEmpty) {
-        new Array[T](maxBatch)
-      } else {
-        val (slots, queue) = unusedArrays.dequeue
-        unusedArrays = queue
-        slots
-      }
+  private final def completeBatch(completed: Batch[T]) {
+    assert(!completed.maybeRecycled)
+    completed.maybeRecycled = true
 
-      currentBatch = new Batch[T](maxBatch, generation = nextGeneration, slots = newSlots)
-      nextGeneration = nextGeneration + 1
+    // get a new batch
+    val newBatch = repeatIfInterrupted({ mainPool.take() })
+    assert(newBatch != null)
 
-      newBatchCondition.signalAll()
-    } finally {
-      completeBatchLock.unlock
-    }
+    newBatch.unrecycle()
+    currentBatch = newBatch
 
     assert(completed.filled.get == completed.maxSize)
     assert(completed.reserved.get >= completed.maxSize)
@@ -357,19 +478,14 @@ private[akka] class BatchDrainedQueue[T: Manifest](maxBatch: Int,
     synchronousDrainer.drain(completed.slots, completed.maxSize - completed.padding)
 
     // now recycle
-    try {
-      completeBatchLock.lock
-      unusedArrays = unusedArrays.enqueue(completed.slots)
-    } finally {
-      completeBatchLock.unlock
-    }
+    completed.recycle()
   }
 
   @tailrec
   final def flush() {
     val current = currentBatch
 
-    if (current.filled.get > 0) {
+    if (current.reserved.get > 0) {
       // fill up current batch immediately then drain it
       val current = currentBatch
 
@@ -378,7 +494,7 @@ private[akka] class BatchDrainedQueue[T: Manifest](maxBatch: Int,
         if (current.reserved.compareAndSet(reserved, current.maxSize)) {
           val delta = current.maxSize - reserved
 
-          // note that the newly-reserved slots are just padding
+          // mark that the newly-reserved slots are just padding
           assert(current.padding == 0)
           current.padding = delta
 
@@ -390,6 +506,8 @@ private[akka] class BatchDrainedQueue[T: Manifest](maxBatch: Int,
           // the last one to do so will complete the batch,
           // or if we're the last, we complete it.
           if (filled == current.maxSize) {
+            assert(!current.maybeRecycled)
+            current.whyRecycled = "added " + current.padding + " padding"
             completeBatch(current)
           }
         } else {

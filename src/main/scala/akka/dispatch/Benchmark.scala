@@ -148,6 +148,8 @@ class Benchmarker {
 }
 
 class ExpiresImmediately(val latch: CountDownLatch) extends Expirable {
+  val serial = ExpiresImmediately.serial.getAndIncrement
+
   @volatile var expired = false
   override def checkExpired(currentTimeNanos: Long): Long = {
     if (!expired) {
@@ -156,10 +158,20 @@ class ExpiresImmediately(val latch: CountDownLatch) extends Expirable {
     }
     0
   }
+
+  override def toString = {
+    "ExpiresImmediately(%d,expired=%b)".format(serial, expired)
+  }
+}
+
+object ExpiresImmediately {
+  val serial = new AtomicInteger(0)
 }
 
 // this is the pseudo-realistic case
 class ExpiresVarying(val latch: CountDownLatch) extends Expirable {
+  val serial = ExpiresVarying.serial.getAndIncrement
+
   val startTime = TimeUnit.MILLISECONDS.toNanos(System.currentTimeMillis)
   // completion varies from 0 to 90ms after creation
   val completeTime = startTime + TimeUnit.MILLISECONDS.toNanos((ExpiresVarying.cycle.getAndIncrement % 10) * 10)
@@ -189,10 +201,15 @@ class ExpiresVarying(val latch: CountDownLatch) extends Expirable {
       0
     }
   }
+
+  override def toString = {
+    "ExpiresVarying(%d,expired=%b)".format(serial, expired)
+  }
 }
 
 object ExpiresVarying {
   val cycle = new AtomicInteger(0)
+  val serial = new AtomicInteger(0)
 }
 
 object Benchmark extends App {
@@ -203,7 +220,17 @@ object Benchmark extends App {
     // enough threads to get some contention
     val executor = Executors.newFixedThreadPool(threads)
     val runnable = new Runnable() {
-      override def run() { body() }
+      override def run() {
+        try {
+          body()
+        } catch {
+          case e => {
+            System.err.println("" + e.getClass.getSimpleName + ": " + e.getMessage)
+            System.err.println(e.getStackTraceString)
+            System.exit(1)
+          }
+        }
+      }
     }
     for (i <- 1 to threads) {
       executor.execute(runnable)
@@ -234,19 +261,22 @@ object Benchmark extends App {
     benchmarker.addBenchmark(iterations, 1, "ConcurrentLinkedQueue", () => {
       val service = new ConcurrentQueueExpirationService
       doExpireImmediately(service)
+      service.shutdown()
     })
 
     // this one is one-tenth the iterations because it's so miserably slow
     benchmarker.addBenchmark(iterations / 10, 1, "scheduleOnce per expirable", () => {
       val service = new NaiveImmediateExpirationService
       doExpireImmediately(service)
+      service.shutdown()
     })
 
-    for (batch <- Seq(10, 100, 1000, 5000)) {
-      benchmarker.addBenchmark(iterations, 1, "BatchDrainedQueue maxBatch=%4d".format(batch),
+    for (batch <- Seq(100, 1000, 5000)) {
+      benchmarker.addBenchmark(iterations, 1, "BatchDrained maxBatch=%4d".format(batch),
                                () => {
                                  val service = new BatchDrainedExpirationService(maxBatch = batch)
                                  doExpireImmediately(service)
+                                 service.shutdown()
                                })
     }
 
@@ -282,6 +312,7 @@ object Benchmark extends App {
     benchmarker.addBenchmark(iterations, 1, "scheduleOnce per expirable", () => {
       val service = new NaiveExpirationService
       doExpireVarying(service)
+      service.shutdown()
     })
 
     for (resolutionMs <- Seq(1, 5, 21, 200)) {
@@ -291,15 +322,17 @@ object Benchmark extends App {
                                () => {
                                  val service = new ConcurrentQueueExpirationService(resolutionNs)
                                  doExpireVarying(service)
+                                 service.shutdown()
                                })
 
 
-      for (batch <- Seq(10, 100, 3000)) {
+      for (batch <- Seq(100, 3000)) {
         benchmarker.addBenchmark(iterations, 1, "BatchDrained bat=%4d res=%4dms".format(batch, resolutionMs),
                                  () => {
                                    val service = new BatchDrainedExpirationService(maxBatch = batch,
                                                       resolutionInNanos = resolutionNs)
                                    doExpireVarying(service)
+                                   service.shutdown()
                                  })
       }
     }
