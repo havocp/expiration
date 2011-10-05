@@ -261,6 +261,10 @@ private[akka] class BatchDrainedExpirationService(maxBatch: Int, resolutionInNan
   override def drainNow() {
     drain.flush()
   }
+
+  override def shutdown() {
+    drain.shutdown()
+  }
 }
 
 private[akka] trait BatchDrainer[T <: AnyRef] {
@@ -270,7 +274,9 @@ private[akka] trait BatchDrainer[T <: AnyRef] {
   def drain(batch: Array[T], count: Int): Unit
 }
 
-private class Batch[T <: AnyRef : Manifest](val maxSize: Int, val slots: Array[T], val recycleTo: BlockingQueue[Batch[T]]) {
+private class Batch[T <: AnyRef : Manifest](val maxSize: Int, val slots: Array[T],
+                                            val recycleTo: BlockingQueue[Batch[T]],
+                                            val runner: (Batch[T]) => Unit) extends Runnable {
   require(slots.size == maxSize)
   val reserved = new AtomicInteger(maxSize)
   val filled = new AtomicInteger(maxSize)
@@ -326,20 +332,49 @@ private class Batch[T <: AnyRef : Manifest](val maxSize: Int, val slots: Array[T
     reserved.set(0) // do this LAST to "unlock"
   }
 
+  // Batch implements Runnable directly to avoid an extra object
+  override def run() {
+    runner(this)
+  }
+
   override def toString = {
     "Batch(reserved=%d,filled=%d,padding=%d)".format(reserved.get, filled.get, padding) + " whyRecycled=" + whyRecycled
   }
 }
 
 private class BatchPool[T <: AnyRef : Manifest](poolSize: Int,
+                                                drainThreadCount: Int,
                                                 maxBatch: Int,
                                                 synchronousDrainer: BatchDrainer[T]) {
   // FIXME it would be better for cache behavior if this were a LIFO
   // rather than a FIFO.
   private val batchPool = new ArrayBlockingQueue[Batch[T]](poolSize)
 
+  private val drainThreads =  new ThreadPoolExecutor(0, // core pool size
+                                                     drainThreadCount, // max pool size
+                                                     60L, TimeUnit.SECONDS, // keep alive time
+                                                     new SynchronousQueue[Runnable])
+
+  // this is essential: it throttles the calling threads if draining
+  // is the bottleneck
+  drainThreads.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy())
+
+  private val drainThreadsFactory = {
+    val defaultFactory = Executors.defaultThreadFactory
+    new ThreadFactory() {
+      override def newThread(r: Runnable): Thread = {
+        val t = defaultFactory.newThread(r)
+        t.setName("akka:batch-drain:" + BatchPool.nextThreadSequence.getAndIncrement)
+        t
+      }
+    }
+  }
+
+  drainThreads.setThreadFactory(drainThreadsFactory)
+
   private final def createBatch() = {
-    new Batch[T](maxBatch, slots = new Array[T](maxBatch), recycleTo=batchPool)
+    new Batch[T](maxBatch, slots = new Array[T](maxBatch), recycleTo=batchPool,
+               runner=runDrainAndRecycle)
   }
 
   for (i <- 1 to poolSize) {
@@ -368,10 +403,7 @@ private class BatchPool[T <: AnyRef : Manifest](poolSize: Int,
     newBatch
   }
 
-  def complete(completed: Batch[T]) {
-    assert(!completed.maybeRecycled)
-    completed.maybeRecycled = true
-
+  private def runDrainAndRecycle(completed: Batch[T]) {
     assert(completed.filled.get == completed.maxSize)
     assert(completed.reserved.get >= completed.maxSize)
 
@@ -381,6 +413,32 @@ private class BatchPool[T <: AnyRef : Manifest](poolSize: Int,
     // now recycle
     completed.recycle()
   }
+
+  def complete(completed: Batch[T]) {
+    assert(!completed.maybeRecycled)
+    completed.maybeRecycled = true
+
+    drainThreads.execute(completed)
+  }
+
+  def shutdown() {
+    drainThreads.shutdown()
+    try {
+      if (!drainThreads.awaitTermination(2, TimeUnit.SECONDS)) {
+        drainThreads.shutdownNow()
+        drainThreads.awaitTermination(30, TimeUnit.SECONDS)
+      }
+    } catch {
+      case e: InterruptedException => {
+        drainThreads.shutdownNow()
+        drainThreads.awaitTermination(30, TimeUnit.SECONDS)
+      }
+    }
+  }
+}
+
+private object BatchPool {
+  val nextThreadSequence = new AtomicInteger(1)
 }
 
 /* This does NOT guarantee FIFO, i.e. it's not a queue.
@@ -395,9 +453,32 @@ private[akka] class BatchDrain[T <: AnyRef : Manifest](maxBatch: Int,
   val drainCount = Runtime.getRuntime().availableProcessors()
   val drains = new Array[UnreliableBatchDrain[T]](drainCount)
 
-  // two batches per drain, so each drain can have one live and one spare
-  private val batchPoolSize = drainCount * 2
-  private val batchPool = new BatchPool[T](batchPoolSize, maxBatch, synchronousDrainer)
+  // this is an interesting tuning problem: if we don't drain in separate
+  // threads, then naturally no more than two batches per drain will
+  // be needed and we never spin waiting for a free drain, because
+  // the drain-filling threads end up working on drain-draining also.
+  // however, draining in a thread keeps the drain-filling threads
+  // from getting tied up unexpectedly to do a drain task.
+  // with a small number of draining threads, as long as we keep up
+  // then the drain-filling threads won't get stuck, but if draining
+  // becomes the bottleneck we'll use CallerRunsPolicy and throttle
+  // the drain-fillers by making them do some work.
+  private val drainThreadCount = math.max(1, drainCount / 2)
+
+  // two batches per drain means each drain can have one live and one spare.
+  // a bit more than that means we are less likely to start spinning with
+  // no empty batches if draining is the bottleneck (when draining is the
+  // bottleneck, we tend to end up with all batches busy draining and
+  // spinning for a new one to place items in).
+  // If batchPoolSize is at least 2x drainThreadCount, then we should
+  // have a batch free per drain for each one currently being drained,
+  // which is desirable. When those free batches are full and all
+  // threads are still draining, then we want the CallerRunsPolicy
+  // to kick in and the drain-filling threads have to run the drainer.
+  private val batchPoolSize = (drainCount * 2.5).intValue
+
+  private val batchPool = new BatchPool[T](batchPoolSize, drainThreadCount,
+                                           maxBatch, synchronousDrainer)
 
   for (i <- 0 until drainCount) {
     drains(i) = new UnreliableBatchDrain[T](batchPool)
@@ -427,6 +508,11 @@ private[akka] class BatchDrain[T <: AnyRef : Manifest](maxBatch: Int,
 
   def flush() {
     drains.foreach(_.flush())
+  }
+
+  def shutdown() {
+    flush()
+    batchPool.shutdown()
   }
 }
 
