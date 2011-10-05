@@ -270,7 +270,71 @@ private[akka] trait BatchDrainer[T <: AnyRef] {
   def drain(batch: Array[T], count: Int): Unit
 }
 
-/* This does NOT guarantee FIFO, i.e. it's not a queue */
+private class Batch[T <: AnyRef : Manifest](val maxSize: Int, val slots: Array[T], val recycleTo: BlockingQueue[Batch[T]]) {
+  require(slots.size == maxSize)
+  val reserved = new AtomicInteger(maxSize)
+  val filled = new AtomicInteger(maxSize)
+  // padding = number of slots that don't have real data.
+  // "padding" can only change once (set by the one thread that does a flush() on the batch)
+  // and "padding" is only read while completing the batch, which is done by one thread
+  // and done sequentially after the flush() writes to it.
+  @volatile
+  var padding = 0
+
+  // DEBUG HACK ONLY
+  @volatile
+  var maybeRecycled = true
+
+  // DEBUG ONLY
+  @volatile
+  var whyRecycled: String = "initial construct"
+
+  def recycle() {
+    // these have to continue to prevent any thread that
+    // tests them while we're dead from trying to use the
+    // recycled batch.
+    assert(reserved.get >= maxSize)
+    assert(filled.get == maxSize)
+    padding = 0
+    whyRecycled = "in the dead pool, was: " + whyRecycled
+    recycleTo.add(this)
+  }
+
+  def unrecycle() {
+    try {
+      assert(maybeRecycled)
+      assert(filled.get == maxSize)
+      assert(reserved.get >= maxSize)
+      assert(padding == 0)
+    } catch {
+      case e => {
+        println("unrecycle broken: " + this)
+        throw e
+      }
+    }
+
+    // it's possible a thread still has hold of the batch
+    // from when it was previously current. having reserved
+    // >= maxSize was keeping that thread from doing anything
+    // with it; so right here, we enable that thread to again
+    // touch the object. we set other stuff first, then reserved,
+    // because reserved < maxSize is the thing that lets a thread
+    // get a reservation and thus start using the batch.
+    whyRecycled = "not recycled, alive again"
+    maybeRecycled = false
+    filled.set(0)
+    reserved.set(0) // do this LAST to "unlock"
+  }
+
+  override def toString = {
+    "Batch(reserved=%d,filled=%d,padding=%d)".format(reserved.get, filled.get, padding) + " whyRecycled=" + whyRecycled
+  }
+}
+
+/* This does NOT guarantee FIFO, i.e. it's not a queue.
+ * It does however reliably send everything you give it
+ * to the drainer you give it.
+ */
 private[akka] class BatchDrain[T <: AnyRef : Manifest](maxBatch: Int,
                                                        synchronousDrainer: BatchDrainer[T]) {
 
@@ -279,8 +343,25 @@ private[akka] class BatchDrain[T <: AnyRef : Manifest](maxBatch: Int,
   val drainCount = Runtime.getRuntime().availableProcessors()
   val drains = new Array[UnreliableBatchDrain[T]](drainCount)
 
+  // two batches per drain, so each drain can have one live and one spare
+  private val batchPoolSize = drainCount * 2
+  // FIXME it would be better for cache behavior if this were a LIFO
+  // rather than a FIFO.
+  private val batchPool = new ArrayBlockingQueue[Batch[T]](batchPoolSize)
+
+  private final def createBatch() = {
+    new Batch[T](maxBatch, slots = new Array[T](maxBatch), recycleTo=batchPool)
+  }
+
+  for (i <- 1 to batchPoolSize) {
+    val b = createBatch()
+    b.maybeRecycled = true
+    b.whyRecycled = "initial creation"
+    batchPool.put(b)
+  }
+
   for (i <- 0 until drainCount) {
-    drains(i) = new UnreliableBatchDrain[T](maxBatch, synchronousDrainer)
+    drains(i) = new UnreliableBatchDrain[T](maxBatch, synchronousDrainer, batchPool)
   }
 
   // the general idea is to stay with the same drain until
@@ -313,7 +394,8 @@ private[akka] class BatchDrain[T <: AnyRef : Manifest](maxBatch: Int,
  * it's also allowed to fail to queue stuff (returning false from offer())
  */
 private[akka] class UnreliableBatchDrain[T <: AnyRef : Manifest](maxBatch: Int,
-                                                                 synchronousDrainer: BatchDrainer[T]) {
+                                                                 synchronousDrainer: BatchDrainer[T],
+                                                                 batchSource: BlockingQueue[Batch[T]]) {
 
   final def repeatIfInterrupted[T](body: => T): T = {
     try {
@@ -325,88 +407,18 @@ private[akka] class UnreliableBatchDrain[T <: AnyRef : Manifest](maxBatch: Int,
     }
   }
 
-  private class Batch[T <: AnyRef : Manifest](val maxSize: Int, val slots: Array[T], val recycleTo: BlockingQueue[Batch[T]]) {
-    require(slots.size == maxSize)
-    val reserved = new AtomicInteger(maxSize)
-    val filled = new AtomicInteger(maxSize)
-    // padding = number of slots that don't have real data.
-    // "padding" can only change once (set by the one thread that does a flush() on the batch)
-    // and "padding" is only read while completing the batch, which is done by one thread
-    // and done sequentially after the flush() writes to it.
-    @volatile
-    var padding = 0
+  final private def takeBatch() = {
+    val newBatch = repeatIfInterrupted({ batchSource.take() })
+    assert(newBatch != null)
 
-    // DEBUG HACK ONLY
-    @volatile
-    var maybeRecycled = true
+    newBatch.unrecycle()
 
-    @volatile
-    var whyRecycled: String = "initial construct"
-
-    def recycle() {
-      // these have to continue to prevent any thread that
-      // tests them while we're dead from trying to use the
-      // recycled batch.
-      assert(reserved.get >= maxSize)
-      assert(filled.get == maxSize)
-      padding = 0
-      whyRecycled = "in the dead pool, was: " + whyRecycled
-      recycleTo.add(this)
-    }
-
-    def unrecycle() {
-      try {
-        assert(maybeRecycled)
-        assert(filled.get == maxSize)
-        assert(reserved.get >= maxSize)
-        assert(padding == 0)
-      } catch {
-        case e => {
-          println("unrecycle broken: " + this)
-          throw e
-        }
-      }
-
-      // it's possible a thread still has hold of the batch
-      // from when it was previously current. having reserved
-      // >= maxSize was keeping that thread from doing anything
-      // with it; so right here, we enable that thread to again
-      // touch the object. we set other stuff first, then reserved,
-      // because reserved < maxSize is the thing that lets a thread
-      // get a reservation and thus start using the batch.
-      whyRecycled = "not recycled, alive again"
-      maybeRecycled = false
-      filled.set(0)
-      reserved.set(0) // do this LAST to "unlock"
-    }
-
-    override def toString = {
-      "Batch(reserved=%d,filled=%d,padding=%d)".format(reserved.get, filled.get, padding) + " whyRecycled=" + whyRecycled
-    }
-  }
-
-  private val batchPoolSize = 2 // just two batches that swap
-  private val mainPool = new ArrayBlockingQueue[Batch[T]](batchPoolSize)
-
-  private final def createBatch() = {
-    new Batch[T](maxBatch, slots = new Array[T](maxBatch), recycleTo=mainPool)
+    newBatch
   }
 
   @volatile
-  private var currentBatch = createBatch()
-  currentBatch.filled.set(0)
-  currentBatch.reserved.set(0)
-  currentBatch.maybeRecycled = false
+  private var currentBatch = takeBatch()
   currentBatch.whyRecycled = "initial current batch"
-
-  // one of the batches is in currentBatch, so we put
-  // batchPoolSize - 1 in the queue.
-  for (i <- 1 to (batchPoolSize - 1)) {
-    val b = createBatch()
-    b.maybeRecycled = true
-    b.whyRecycled = "initial creation"
-    mainPool.put(b)
-  }
 
   // the general goal is to make an this just an array assignment
   // and a couple of integer increments.
@@ -464,12 +476,8 @@ private[akka] class UnreliableBatchDrain[T <: AnyRef : Manifest](maxBatch: Int,
     assert(!completed.maybeRecycled)
     completed.maybeRecycled = true
 
-    // get a new batch
-    val newBatch = repeatIfInterrupted({ mainPool.take() })
-    assert(newBatch != null)
-
-    newBatch.unrecycle()
-    currentBatch = newBatch
+    // set a new batch
+    currentBatch = takeBatch()
 
     assert(completed.filled.get == completed.maxSize)
     assert(completed.reserved.get >= completed.maxSize)
