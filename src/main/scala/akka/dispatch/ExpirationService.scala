@@ -350,9 +350,14 @@ private class BatchPool[T <: AnyRef : Manifest](poolSize: Int,
   // rather than a FIFO.
   private val batchPool = new ArrayBlockingQueue[Batch[T]](poolSize)
 
+  // these two are related to creating batches on demand
+  private val createdCount = new AtomicInteger(0)
+  @volatile
+  private var atMaxBatches = false
+
   private val drainThreads =  new ThreadPoolExecutor(0, // core pool size
                                                      drainThreadCount, // max pool size
-                                                     60L, TimeUnit.SECONDS, // keep alive time
+                                                     180L, TimeUnit.SECONDS, // keep alive time
                                                      new SynchronousQueue[Runnable])
 
   // this is essential: it throttles the calling threads if draining
@@ -372,18 +377,6 @@ private class BatchPool[T <: AnyRef : Manifest](poolSize: Int,
 
   drainThreads.setThreadFactory(drainThreadsFactory)
 
-  private final def createBatch() = {
-    new Batch[T](maxBatch, slots = new Array[T](maxBatch), recycleTo=batchPool,
-               runner=runDrainAndRecycle)
-  }
-
-  for (i <- 1 to poolSize) {
-    val b = createBatch()
-    b.maybeRecycled = true
-    b.whyRecycled = "initial creation"
-    batchPool.put(b)
-  }
-
   final def repeatIfInterrupted[T](body: => T): T = {
     try {
       body
@@ -394,10 +387,38 @@ private class BatchPool[T <: AnyRef : Manifest](poolSize: Int,
     }
   }
 
-  def take(): Batch[T] = {
-    val newBatch = repeatIfInterrupted({ batchPool.take() })
-    assert(newBatch != null)
+  private final def createBatch() = {
+    val b = new Batch[T](maxBatch, slots = new Array[T](maxBatch), recycleTo=batchPool,
+                         runner=runDrainAndRecycle)
+    b.maybeRecycled = true
+    b.whyRecycled = "initial creation"
+    b
+  }
 
+  def take(): Batch[T] = {
+    val newBatch = if (atMaxBatches) {
+      repeatIfInterrupted({ batchPool.take() })
+    } else {
+      // the atMaxBatches flag is intended to avoid
+      // this extra poll(). for a short window of time we
+      // can still get to the case below where
+      // n >= poolSize though.
+      val existing = batchPool.poll()
+      if (existing == null) {
+        val n = createdCount.getAndIncrement
+        if (n >= poolSize) {
+          // already at pool size; just block
+          repeatIfInterrupted({ batchPool.take() })
+        } else {
+          if (n == (poolSize - 1))
+            atMaxBatches = true
+          createBatch()
+        }
+      } else {
+        existing
+      }
+    }
+    assert(newBatch != null)
     newBatch.unrecycle()
 
     newBatch
