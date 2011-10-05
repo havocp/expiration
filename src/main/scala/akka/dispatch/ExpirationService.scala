@@ -331,6 +331,58 @@ private class Batch[T <: AnyRef : Manifest](val maxSize: Int, val slots: Array[T
   }
 }
 
+private class BatchPool[T <: AnyRef : Manifest](poolSize: Int,
+                                                maxBatch: Int,
+                                                synchronousDrainer: BatchDrainer[T]) {
+  // FIXME it would be better for cache behavior if this were a LIFO
+  // rather than a FIFO.
+  private val batchPool = new ArrayBlockingQueue[Batch[T]](poolSize)
+
+  private final def createBatch() = {
+    new Batch[T](maxBatch, slots = new Array[T](maxBatch), recycleTo=batchPool)
+  }
+
+  for (i <- 1 to poolSize) {
+    val b = createBatch()
+    b.maybeRecycled = true
+    b.whyRecycled = "initial creation"
+    batchPool.put(b)
+  }
+
+  final def repeatIfInterrupted[T](body: => T): T = {
+    try {
+      body
+    } catch {
+      case e: InterruptedException =>
+        // this is unfortunately not a tail call, not sure I understand why
+        repeatIfInterrupted(body)
+    }
+  }
+
+  def take(): Batch[T] = {
+    val newBatch = repeatIfInterrupted({ batchPool.take() })
+    assert(newBatch != null)
+
+    newBatch.unrecycle()
+
+    newBatch
+  }
+
+  def complete(completed: Batch[T]) {
+    assert(!completed.maybeRecycled)
+    completed.maybeRecycled = true
+
+    assert(completed.filled.get == completed.maxSize)
+    assert(completed.reserved.get >= completed.maxSize)
+
+    // drain the batch
+    synchronousDrainer.drain(completed.slots, completed.maxSize - completed.padding)
+
+    // now recycle
+    completed.recycle()
+  }
+}
+
 /* This does NOT guarantee FIFO, i.e. it's not a queue.
  * It does however reliably send everything you give it
  * to the drainer you give it.
@@ -345,23 +397,10 @@ private[akka] class BatchDrain[T <: AnyRef : Manifest](maxBatch: Int,
 
   // two batches per drain, so each drain can have one live and one spare
   private val batchPoolSize = drainCount * 2
-  // FIXME it would be better for cache behavior if this were a LIFO
-  // rather than a FIFO.
-  private val batchPool = new ArrayBlockingQueue[Batch[T]](batchPoolSize)
-
-  private final def createBatch() = {
-    new Batch[T](maxBatch, slots = new Array[T](maxBatch), recycleTo=batchPool)
-  }
-
-  for (i <- 1 to batchPoolSize) {
-    val b = createBatch()
-    b.maybeRecycled = true
-    b.whyRecycled = "initial creation"
-    batchPool.put(b)
-  }
+  private val batchPool = new BatchPool[T](batchPoolSize, maxBatch, synchronousDrainer)
 
   for (i <- 0 until drainCount) {
-    drains(i) = new UnreliableBatchDrain[T](maxBatch, synchronousDrainer, batchPool)
+    drains(i) = new UnreliableBatchDrain[T](batchPool)
   }
 
   // the general idea is to stay with the same drain until
@@ -375,6 +414,7 @@ private[akka] class BatchDrain[T <: AnyRef : Manifest](maxBatch: Int,
     if (drains(c).offer(t)) {
       // ok! best case scenario.
     } else {
+      // suck! we need a new drain
       if (c == (drainCount - 1)) {
         current.compareAndSet(c, 0)
       } else {
@@ -393,31 +433,10 @@ private[akka] class BatchDrain[T <: AnyRef : Manifest](maxBatch: Int,
 /* This does NOT guarantee FIFO, i.e. it's not a queue;
  * it's also allowed to fail to queue stuff (returning false from offer())
  */
-private[akka] class UnreliableBatchDrain[T <: AnyRef : Manifest](maxBatch: Int,
-                                                                 synchronousDrainer: BatchDrainer[T],
-                                                                 batchSource: BlockingQueue[Batch[T]]) {
-
-  final def repeatIfInterrupted[T](body: => T): T = {
-    try {
-      body
-    } catch {
-      case e: InterruptedException =>
-        // this is unfortunately not a tail call, not sure I understand why
-        repeatIfInterrupted(body)
-    }
-  }
-
-  final private def takeBatch() = {
-    val newBatch = repeatIfInterrupted({ batchSource.take() })
-    assert(newBatch != null)
-
-    newBatch.unrecycle()
-
-    newBatch
-  }
+private[akka] class UnreliableBatchDrain[T <: AnyRef : Manifest](batchPool: BatchPool[T]) {
 
   @volatile
-  private var currentBatch = takeBatch()
+  private var currentBatch = batchPool.take()
   currentBatch.whyRecycled = "initial current batch"
 
   // the general goal is to make an this just an array assignment
@@ -473,20 +492,8 @@ private[akka] class UnreliableBatchDrain[T <: AnyRef : Manifest](maxBatch: Int,
   }
 
   private final def completeBatch(completed: Batch[T]) {
-    assert(!completed.maybeRecycled)
-    completed.maybeRecycled = true
-
-    // set a new batch
-    currentBatch = takeBatch()
-
-    assert(completed.filled.get == completed.maxSize)
-    assert(completed.reserved.get >= completed.maxSize)
-
-    // drain the batch
-    synchronousDrainer.drain(completed.slots, completed.maxSize - completed.padding)
-
-    // now recycle
-    completed.recycle()
+    currentBatch = batchPool.take()
+    batchPool.complete(completed)
   }
 
   @tailrec
